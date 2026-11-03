@@ -27,8 +27,10 @@ IDS = {
     "claude": "PimsClaudeCode00", "carpetas": "PimsCrearCarpeta", "auditar": "PimsAuditar00000",
     "perfilar": "PimsPerfilar0000", "aprobar": "PimsAprobaciones", "renovar": "PimsRenovaciones",
     "consultas": "PimsConsultas000", "admin": "PimsAdministrar0", "pagina": "PimsPaginaWeb000",
-    "chat": "PimsChat00000000",
+    "chat": "PimsChat00000000", "bd": "PimsBaseDatos000",
 }
+# Credencial Postgres de n8n (rol agente7). La crea n8n/configurar_bd.py con este id fijo.
+CREDENCIAL_BD = {"id": "PimsPostgresBD01", "name": "PIMS Postgres"}
 
 # --------------------------------------------------------------------------- JS común
 COMUN = r"""
@@ -302,6 +304,62 @@ try { if (j.stdout) r = JSON.parse(j.stdout); } catch (e) { /* se queda el error
 return [{ json: r }];
 """)
     f.cadena("Entrada", "Comando", "Ejecutar", "Resultado")
+    return f
+
+
+def flujo_bd():
+    f = Flujo("bd", "PIMS · Base de datos (Postgres del PIMS Gestitel)",
+              "Escribe en la base del PIMS con las funciones de bd/agente7_terceros_dpa.sql. Entrada: "
+              "{operacion: guardar_auditoria, registro, informe} o {operacion: registrar_decision, id, rol, decision, "
+              "usuario, cargo, comentario, fecha}. Lee datos/config_bd.json: si 'activo' es false no hace nada. "
+              "Salida: {ok, omitido?, error?, resultado?}. Nunca detiene al flujo que lo llama.")
+    f.entrada()
+    f.code("Pedir configuración", (220, 0), r"""
+return [{ json: { clave: 'cfg', ruta: R('datos', 'config_bd.json') } }];
+""")
+    f.llamar("Leer configuración", (440, 0), "leer")
+    f.code("Preparar consulta", (660, 0), r"""
+const p = $('Entrada').first().json;
+let cfg;
+try { cfg = jsonDe($input.all().map((x) => x.json), 'cfg'); } catch (e) { return [{ json: { ok: false, activo: false, error: e.message } }]; }
+if (!cfg || !cfg.activo) return [{ json: { ok: true, activo: false, omitido: true } }];
+const esq = String(cfg.esquema || 'demo');
+if (!/^[a-z_][a-z0-9_]{0,62}$/.test(esq)) return [{ json: { ok: false, activo: false, error: `Esquema no válido en config_bd.json: ${esq}` } }];
+const autor = Number(cfg.usuario_autor_id);
+if (!Number.isInteger(autor) || autor < 1) return [{ json: { ok: false, activo: false, error: "Falta 'usuario_autor_id' en config_bd.json." } }];
+// Los valores van como parámetros ($1, $2…): el contrato y los comentarios son contenido no confiable.
+if (p.operacion === 'guardar_auditoria' && p.registro)
+  return [{ json: { activo: true, consulta: `SELECT ${esq}.agente7_guardar_auditoria($1::jsonb, $2, ${autor}) AS id`,
+    parametros: [p.registro, p.informe ?? null] } }];
+if (p.operacion === 'registrar_decision')
+  return [{ json: { activo: true, consulta: `SELECT ${esq}.agente7_registrar_decision($1, $2, $3, $4, $5, $6, $7::timestamptz) AS estado`,
+    parametros: [p.id, p.rol, p.decision, p.usuario, p.cargo ?? null, p.comentario ?? '', p.fecha ?? null] } }];
+return [{ json: { ok: true, activo: false, omitido: true } }];
+""")
+    f.si("¿Base activa?", (880, 0), "={{ $json.activo }}")
+    f.nodo("Postgres", "n8n-nodes-base.postgres", 2.6, {
+        "operation": "executeQuery", "query": "={{ $json.consulta }}",
+        "options": {"queryReplacement": "={{ $json.parametros }}"}}, (1100, -100),
+        credentials={"postgres": CREDENCIAL_BD}, onError="continueRegularOutput", alwaysOutputData=True)
+    f.code("Resultado", (1320, -100), r"""
+const j = $input.first().json;
+// Con onError=continueRegularOutput el nodo devuelve { message, error }; el texto útil se reparte
+// entre message, error.message y error.description (p. ej. "Connection refused" y "127.0.0.1:5432").
+if (j.error) {
+  const e = typeof j.error === 'object' ? j.error : { message: String(j.error) };
+  const partes = [j.message, e.message, e.description].filter((x, i, a) => x && a.indexOf(x) === i);
+  return [{ json: { ok: false, error: (partes.join(' — ') || JSON.stringify(e)).slice(0, 500) } }];
+}
+return [{ json: { ok: true, resultado: j } }];
+""")
+    f.code("Sin base", (1100, 100), r"""
+const j = $input.first().json;
+return [{ json: { ok: j.ok !== false, omitido: true, error: j.error || null } }];
+""")
+    f.cadena("Entrada", "Pedir configuración", "Leer configuración", "Preparar consulta", "¿Base activa?")
+    f.unir("¿Base activa?", "Postgres", 0)
+    f.unir("¿Base activa?", "Sin base", 1)
+    f.unir("Postgres", "Resultado")
     return f
 
 
@@ -619,7 +677,32 @@ const v = $('Validar petición').first().json;
 return [archivoTrabajo(v.trabajo, { tipo: 'auditoria', organizacion: v.organizacion, proveedor: v.proveedor,
   estado: 'error', mensaje: $input.first().json.error, inicio: v.inicio, fin: ahora() })];
 """)
-    f.llamar("Guardar resultado", (4620, -100), "guardar")
+    # Base de datos del PIMS (si datos/config_bd.json la activa). Los archivos se escriben siempre:
+    # son la copia de respaldo mientras dure la doble escritura.
+    f.code("BD: preparar", (4620, -200), r"""
+const it = $input.all().map((x) => x.json);
+const reg = it.find((j) => /\/datos\/registro\/[^/]+\.json$/.test(j.ruta || ''));
+if (!reg) return [{ json: { operacion: 'nada' } }];
+const md = it.find((j) => j.ruta === reg.ruta.replace(/\.json$/, '.md'));
+return [{ json: { operacion: 'guardar_auditoria', registro: reg.texto, informe: md ? md.texto : null } }];
+""")
+    f.llamar("Base de datos", (4840, -200), "bd", onError="continueRegularOutput")
+    f.code("BD: anotar", (5060, -100), r"""
+const items = $('Calcular y componer').all().map((x) => ({ json: Object.assign({}, x.json) }));
+const b = $input.first().json || {};
+const err = b.error && typeof b.error === 'object' ? (b.error.message || JSON.stringify(b.error)) : b.error;
+const t = items.find((x) => /\/datos\/trabajos\/[^/]+\.json$/.test(x.json.ruta || ''));
+if (t && !b.omitido) {
+  const trabajo = JSON.parse(t.json.texto);
+  if (b.ok === false || err) {
+    trabajo.bd = 'error';
+    trabajo.advertencias = (trabajo.advertencias || []).concat([`No se guardó en la base de datos: ${err || 'error desconocido'}. El registro en disco sigue siendo válido.`]);
+  } else if (b.resultado) trabajo.bd = 'guardado';
+  t.json.texto = JSON.stringify(trabajo, null, 2);
+}
+return items;
+""")
+    f.llamar("Guardar resultado", (5280, -100), "guardar")
     f.cadena("Webhook auditar", "Validar petición", "¿Petición válida?")
     f.unir("¿Petición válida?", "Registrar trabajo", 0)
     f.unir("¿Petición válida?", "Responder error", 1)
@@ -630,7 +713,8 @@ return [archivoTrabajo(v.trabajo, { tipo: 'auditoria', organizacion: v.organizac
     f.cadena("Estado: evaluando", "Guardar estado", "Petición al modelo", "Modelo", "Procesar respuesta", "¿Corregir JSON?")
     f.unir("¿Corregir JSON?", "Pedir corrección", 0)
     f.unir("¿Corregir JSON?", "Calcular y componer", 1)
-    f.cadena("Pedir corrección", "Modelo (corrección)", "Procesar corrección", "Calcular y componer", "Guardar resultado")
+    f.cadena("Pedir corrección", "Modelo (corrección)", "Procesar corrección", "Calcular y componer",
+             "BD: preparar", "Base de datos", "BD: anotar", "Guardar resultado")
     f.unir("Error de contexto", "Guardar resultado")
     return f
 
@@ -869,12 +953,25 @@ return items;
 """, "prompts")
     f.si("¿Transición válida?", (1320, -100), "={{ $json.ok !== false }}")
     f.llamar("Guardar registro", (1540, -200), "guardar")
-    f.code("Respuesta aprobar", (1760, -200), r"""
+    f.code("BD: decisión", (1760, -300), r"""
 const v = $('Validar decisión').first().json;
 const res = JSON.parse($('Aplicar decisión').first().json.texto);
-const fallo = $input.all().map((x) => x.json).find((g) => !g.ok);
+const ev = res.aprobacion.historial[res.aprobacion.historial.length - 1];
+return [{ json: { operacion: 'registrar_decision', id: v.id, rol: ev.rol, decision: ev.decision, usuario: ev.usuario,
+  cargo: ev.cargo, comentario: ev.comentario, fecha: ev.fecha } }];
+""")
+    f.llamar("Base de datos", (1980, -300), "bd", onError="continueRegularOutput")
+    f.code("Respuesta aprobar", (2200, -200), r"""
+const v = $('Validar decisión').first().json;
+const res = JSON.parse($('Aplicar decisión').first().json.texto);
+const fallo = $('Guardar registro').all().map((x) => x.json).find((g) => !g.ok);
 if (fallo) return [{ json: { codigo: 500, respuesta: { ok: false, error: fallo.error } } }];
-return [{ json: { codigo: 200, respuesta: { ok: true, id_registro: v.id, estado: res.aprobacion.estado, historial: res.aprobacion.historial } } }];
+const b = $input.first().json || {};
+const respuesta = { ok: true, id_registro: v.id, estado: res.aprobacion.estado, historial: res.aprobacion.historial };
+// La decisión ya quedó en disco; si la base la rechaza (p. ej. el expediente no se migró), se avisa sin deshacerla.
+const err = b.error && typeof b.error === 'object' ? (b.error.message || JSON.stringify(b.error)) : b.error;
+if (!b.omitido) respuesta.bd = b.ok === false || err ? { ok: false, error: err || 'error desconocido' } : { ok: true };
+return [{ json: { codigo: 200, respuesta } }];
 """)
     f.cadena("Webhook aprobar", "Validar decisión", "¿Decisión válida?")
     f.unir("¿Decisión válida?", "Pedir registro", 0)
@@ -882,7 +979,7 @@ return [{ json: { codigo: 200, respuesta: { ok: true, id_registro: v.id, estado:
     f.cadena("Pedir registro", "Leer registro", "Aplicar decisión", "¿Transición válida?")
     f.unir("¿Transición válida?", "Guardar registro", 0)
     f.unir("¿Transición válida?", "Responder (aprobar)", 1)
-    f.cadena("Guardar registro", "Respuesta aprobar", "Responder (aprobar)")
+    f.cadena("Guardar registro", "BD: decisión", "Base de datos", "Respuesta aprobar", "Responder (aprobar)")
 
     # --- B. El DPO valida el perfil
     f.webhook("Webhook validar perfil", (0, 500), "POST", "pims/perfil/validar")
@@ -1435,9 +1532,9 @@ return [{ json: { codigo: 200, respuesta: { ok: true, mensajes: conv ? conv.mens
     return f
 
 
-FLUJOS = [flujo_leer, flujo_guardar, flujo_claude, flujo_carpetas, flujo_modelo, flujo_auditar,
+FLUJOS = [flujo_leer, flujo_guardar, flujo_claude, flujo_carpetas, flujo_modelo, flujo_bd, flujo_auditar,
           flujo_perfilar, flujo_aprobar, flujo_renovar, flujo_consultas, flujo_admin, flujo_pagina, flujo_chat]
-ORDEN_ARCHIVO = {"leer": "01", "guardar": "02", "claude": "03", "carpetas": "04", "modelo": "05", "auditar": "10",
+ORDEN_ARCHIVO = {"leer": "01", "guardar": "02", "claude": "03", "carpetas": "04", "modelo": "05", "bd": "06", "auditar": "10",
                  "perfilar": "11", "aprobar": "12", "renovar": "13", "consultas": "20", "admin": "21", "pagina": "30", "chat": "14"}
 
 

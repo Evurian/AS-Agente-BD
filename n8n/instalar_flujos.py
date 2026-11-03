@@ -28,7 +28,7 @@ from pathlib import Path
 AQUI = Path(__file__).resolve().parent
 RAIZ = AQUI.parent
 IDS = ["PimsLeerArchivos", "PimsGuardarArchi", "PimsModeloIA0000", "PimsClaudeCode00", "PimsCrearCarpeta",
-       "PimsAuditar00000", "PimsPerfilar0000", "PimsAprobaciones", "PimsRenovaciones", "PimsConsultas000",
+       "PimsBaseDatos000", "PimsAuditar00000", "PimsPerfilar0000", "PimsAprobaciones", "PimsRenovaciones", "PimsConsultas000",
        "PimsAdministrar0", "PimsPaginaWeb000", "PimsChat00000000"]
 
 
